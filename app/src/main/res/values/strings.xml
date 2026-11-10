@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Yaz</string>
+    <string name="settings">Настройки</string>
+    <string name="language_english">English</string>
+    <string name="language_russian">Русский</string>
+    <string name="language_tatar">Татарча</string>
+</resources>
