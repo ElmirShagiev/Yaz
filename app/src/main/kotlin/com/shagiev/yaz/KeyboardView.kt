@@ -18,6 +18,7 @@ import android.view.HapticFeedbackConstants
 import android.view.MotionEvent
 import android.view.SoundEffectConstants
 import android.view.View
+import android.view.ViewConfiguration
 import android.view.WindowInsets
 import android.widget.PopupWindow
 import kotlin.math.min
@@ -67,6 +68,10 @@ class KeyboardView(
     private var rows: List<List<KeyRect>> = emptyList()
     private var pressed: KeyRect? = null
     private var pressedPointerId = -1
+    private var downX = 0f
+    private var downY = 0f
+    private var touchMoved = false
+    private val touchSlop = ViewConfiguration.get(context).scaledTouchSlop.toFloat()
     private var popupWindow: PopupWindow? = null
     private var popupView: PopupView? = null
     private var popupLabels: List<String> = emptyList()
@@ -499,6 +504,7 @@ class KeyboardView(
     }
 
     private fun dismissFloating() {
+        if (!popupVisible && !previewVisible) return
         popupWindow?.dismiss()
         popupVisible = false
         previewVisible = false
@@ -589,7 +595,10 @@ class KeyboardView(
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
                 dismissFloating()
-                pressedPointerId = event.getPointerId(0)
+                pressedPointerId = event.getPointerId(event.actionIndex)
+                downX = event.x
+                downY = event.y
+                touchMoved = false
                 val keyRect = findKey(event.x, event.y) ?: return true
                 pressed = keyRect
                 backspaceRepeating = false
@@ -629,17 +638,25 @@ class KeyboardView(
                     }
                 } else {
                     val current = pressed ?: return true
-                    if (!current.rect.contains(event.x, event.y)) {
-                        pressed = null
-                        handler.removeCallbacks(popupRunnable)
-                        if (previewVisible) {
-                            dismissFloating()
-                        }
-                        if (backspaceRepeating) {
-                            handler.removeCallbacks(backspaceRunnable)
-                            backspaceRepeating = false
-                        }
-                        invalidate()
+                    val dx = event.x - downX
+                    val dy = event.y - downY
+                    if (!touchMoved && dx * dx + dy * dy > touchSlop * touchSlop) {
+                        touchMoved = true
+                    }
+                    if (!touchMoved) {
+                        // Палец почти не двигался: держим клавишу, выбранную
+                        // при нажатии, даже если точка пришлась на зазор.
+                        return true
+                    }
+                    if (event.y < 0f) {
+                        cancelPress()
+                        return true
+                    }
+                    val next = findKey(event.x, event.y)
+                    if (next == null) {
+                        cancelPress()
+                    } else if (next != current) {
+                        switchPressedKey(next)
                     }
                 }
                 return true
@@ -648,6 +665,14 @@ class KeyboardView(
             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
                 handler.removeCallbacks(popupRunnable)
                 handler.removeCallbacks(backspaceRunnable)
+
+                if (!popupVisible &&
+                    event.actionMasked == MotionEvent.ACTION_UP &&
+                    touchMoved &&
+                    pressed != null
+                ) {
+                    pressed = findKey(event.x, event.y)
+                }
 
                 val wasPopup = popupVisible
                 val selectedPopup = popupLabels.getOrNull(popupSelected)
@@ -672,10 +697,37 @@ class KeyboardView(
         return true
     }
 
+    private fun switchPressedKey(keyRect: KeyRect) {
+        pressed = keyRect
+        handler.removeCallbacks(popupRunnable)
+        if (previewVisible) dismissFloating()
+        if (backspaceRepeating) {
+            handler.removeCallbacks(backspaceRunnable)
+            backspaceRepeating = false
+        }
+        if (keyRect.key.type == KeyType.CHAR) {
+            showFloating(true)
+        }
+        if (keyRect.key.popup.isNotEmpty()) {
+            handler.postDelayed(popupRunnable, 350)
+        }
+        invalidate()
+    }
+
+    private fun cancelPress() {
+        handler.removeCallbacks(popupRunnable)
+        handler.removeCallbacks(backspaceRunnable)
+        pressed = null
+        backspaceRepeating = false
+        if (previewVisible || popupVisible) dismissFloating()
+        invalidate()
+    }
+
     private fun resetTouchState() {
         handler.removeCallbacksAndMessages(null)
         pressed = null
         pressedPointerId = -1
+        touchMoved = false
         backspaceRepeating = false
         dismissFloating()
     }
@@ -755,18 +807,14 @@ class KeyboardView(
             KeyType.CHAR -> {
                 val text = if (shift || caps) key.label else key.output
                 service.onText(text)
-                if (shift && !caps) {
-                    shift = false
-                }
-                rebuildLayout()
+                consumeShift()
             }
         }
     }
 
     private fun commitPopup(text: String) {
         service.onText(text)
-        if (shift && !caps) shift = false
-        rebuildLayout()
+        consumeShift()
     }
 
     private fun consumeShift() {
