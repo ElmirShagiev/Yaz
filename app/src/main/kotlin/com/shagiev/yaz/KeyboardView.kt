@@ -9,7 +9,6 @@ import android.graphics.Path
 import android.graphics.RectF
 import android.graphics.Typeface
 import android.graphics.drawable.ColorDrawable
-import android.media.AudioManager
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
@@ -65,12 +64,16 @@ class KeyboardView(
 
     private data class KeyRect(val key: Key, val rect: RectF)
 
+    private data class TouchState(
+        var keyRect: KeyRect,
+        val downX: Float,
+        val downY: Float,
+        var moved: Boolean = false
+    )
+
     private var rows: List<List<KeyRect>> = emptyList()
-    private var pressed: KeyRect? = null
-    private var pressedPointerId = -1
-    private var downX = 0f
-    private var downY = 0f
-    private var touchMoved = false
+    private val activeTouches = mutableMapOf<Int, TouchState>()
+    private var ownerPointerId = -1
     private val touchSlop = ViewConfiguration.get(context).scaledTouchSlop.toFloat()
     private var popupWindow: PopupWindow? = null
     private var popupView: PopupView? = null
@@ -99,6 +102,11 @@ class KeyboardView(
 
     private val backspaceRunnable = object : Runnable {
         override fun run() {
+            if (activeTouches[ownerPointerId]?.keyRect?.key?.type != KeyType.BACKSPACE) {
+                backspaceRepeating = false
+                return
+            }
+            backspaceRepeating = true
             service.onBackspace()
             handler.postDelayed(this, 45)
         }
@@ -171,9 +179,10 @@ class KeyboardView(
         rebuildLayout()
     }
 
-    fun resetForInput() {
-        val changed = page != Page.LETTERS || shift || caps
-        page = Page.LETTERS
+    fun resetForInput(startWithSymbols: Boolean = false) {
+        val startPage = if (startWithSymbols) Page.SYMBOLS else Page.LETTERS
+        val changed = page != startPage || shift || caps
+        page = startPage
         shift = false
         caps = false
         if (changed) rebuildLayout()
@@ -254,7 +263,9 @@ class KeyboardView(
         if (popupVisible) {
             fillPaint.color = Color.argb(55, 0, 0, 0)
             canvas.drawRect(0f, 0f, width.toFloat(), height.toFloat(), fillPaint)
-            pressed?.let { drawKey(canvas, it) }
+            for (touch in activeTouches.values) {
+                drawKey(canvas, touch.keyRect)
+            }
         }
     }
 
@@ -262,7 +273,10 @@ class KeyboardView(
         val key = keyRect.key
         val isSpecial = key.type != KeyType.CHAR
         val activeShift = key.type == KeyType.SHIFT && (shift || caps)
-        val isPressed = pressed == keyRect
+        val isPressed = activeTouches.values.any {
+            it.keyRect.rect.centerX() == keyRect.rect.centerX() &&
+                it.keyRect.rect.centerY() == keyRect.rect.centerY()
+        }
 
         fillPaint.color = when {
             activeShift -> theme.accent
@@ -418,7 +432,7 @@ class KeyboardView(
     }
 
     private fun showFloating(preview: Boolean) {
-        val current = pressed ?: return
+        val current = activeTouches[ownerPointerId]?.keyRect ?: return
         if (!isAttachedToWindow) return
         if (preview && current.key.type != KeyType.CHAR) return
         if (!preview && current.key.popup.isEmpty()) return
@@ -593,112 +607,175 @@ class KeyboardView(
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
         when (event.actionMasked) {
-            MotionEvent.ACTION_DOWN -> {
-                dismissFloating()
-                pressedPointerId = event.getPointerId(event.actionIndex)
-                downX = event.x
-                downY = event.y
-                touchMoved = false
-                val keyRect = findKey(event.x, event.y) ?: return true
-                pressed = keyRect
-                backspaceRepeating = false
-                if (keyRect.key.type != KeyType.EMPTY) playFeedback()
-
-                if (keyRect.key.type == KeyType.CHAR) {
-                    showFloating(true)
-                }
-                if (keyRect.key.popup.isNotEmpty()) {
-                    handler.postDelayed(popupRunnable, 350)
-                }
-                if (keyRect.key.type == KeyType.BACKSPACE) {
-                    handler.postDelayed({
-                        if (pressed?.key?.type == KeyType.BACKSPACE) {
-                            backspaceRepeating = true
-                            handler.post(backspaceRunnable)
-                        }
-                    }, 400)
-                }
-                invalidate()
+            MotionEvent.ACTION_DOWN, MotionEvent.ACTION_POINTER_DOWN -> {
+                val index = event.actionIndex
+                startTouch(
+                    event.getPointerId(index),
+                    event.getX(index),
+                    event.getY(index)
+                )
                 return true
             }
 
             MotionEvent.ACTION_MOVE -> {
-                if (event.getPointerId(0) != pressedPointerId) return true
-                if (popupVisible) {
-                    if (popupBoxWidth > 0f && popupLabels.isNotEmpty()) {
-                        val stride = popupBoxWidth + popupItemGap
-                        val index = ((event.rawX - popupLeft - popupSidePadding) / stride)
-                            .toInt()
-                            .coerceIn(0, popupLabels.lastIndex)
-                        if (index != popupSelected) {
-                            popupSelected = index
-                            popupView?.selected = index
-                            popupView?.invalidate()
-                        }
-                    }
-                } else {
-                    val current = pressed ?: return true
-                    val dx = event.x - downX
-                    val dy = event.y - downY
-                    if (!touchMoved && dx * dx + dy * dy > touchSlop * touchSlop) {
-                        touchMoved = true
-                    }
-                    if (!touchMoved) {
-                        // Палец почти не двигался: держим клавишу, выбранную
-                        // при нажатии, даже если точка пришлась на зазор.
-                        return true
-                    }
-                    if (event.y < 0f) {
-                        cancelPress()
-                        return true
-                    }
-                    val next = findKey(event.x, event.y)
-                    if (next == null) {
-                        cancelPress()
-                    } else if (next != current) {
-                        switchPressedKey(next)
+                for (pointerId in activeTouches.keys.toList()) {
+                    val pointerIndex = event.findPointerIndex(pointerId)
+                    if (pointerIndex >= 0) {
+                        val x = event.getX(pointerIndex)
+                        moveTouch(
+                            pointerId,
+                            x,
+                            event.getY(pointerIndex),
+                            event.rawX - event.x + x
+                        )
                     }
                 }
                 return true
             }
 
-            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                handler.removeCallbacks(popupRunnable)
-                handler.removeCallbacks(backspaceRunnable)
+            MotionEvent.ACTION_POINTER_UP -> {
+                val index = event.actionIndex
+                finishTouch(
+                    event.getPointerId(index),
+                    event.getX(index),
+                    event.getY(index),
+                    commit = true
+                )
+                return true
+            }
 
-                if (!popupVisible &&
-                    event.actionMasked == MotionEvent.ACTION_UP &&
-                    touchMoved &&
-                    pressed != null
-                ) {
-                    pressed = findKey(event.x, event.y)
+            MotionEvent.ACTION_UP -> {
+                val index = event.actionIndex
+                finishTouch(
+                    event.getPointerId(index),
+                    event.getX(index),
+                    event.getY(index),
+                    commit = true
+                )
+                for (pointerId in activeTouches.keys.toList()) {
+                    cancelTouch(pointerId)
                 }
+                return true
+            }
 
-                val wasPopup = popupVisible
-                val selectedPopup = popupLabels.getOrNull(popupSelected)
-                val keyRect = pressed
-                val repeating = backspaceRepeating
-
-                dismissFloating()
-                pressed = null
-                backspaceRepeating = false
-
-                if (event.actionMasked == MotionEvent.ACTION_UP && keyRect != null) {
-                    if (wasPopup && selectedPopup != null) {
-                        commitPopup(selectedPopup)
-                    } else if (!repeating) {
-                        handleKey(keyRect.key)
-                    }
+            MotionEvent.ACTION_CANCEL -> {
+                for (pointerId in activeTouches.keys.toList()) {
+                    cancelTouch(pointerId)
                 }
-                invalidate()
                 return true
             }
         }
         return true
     }
 
-    private fun switchPressedKey(keyRect: KeyRect) {
-        pressed = keyRect
+    private fun startTouch(pointerId: Int, x: Float, y: Float) {
+        if (activeTouches.containsKey(pointerId) || popupVisible) return
+        if (previewVisible) dismissFloating()
+        val keyRect = findKey(x, y) ?: return
+        activeTouches[pointerId] = TouchState(keyRect, x, y)
+        if (ownerPointerId == -1) ownerPointerId = pointerId
+        if (keyRect.key.type != KeyType.EMPTY) playFeedback()
+
+        if (pointerId == ownerPointerId) {
+            if (keyRect.key.type == KeyType.CHAR) {
+                showFloating(true)
+            }
+            if (keyRect.key.popup.isNotEmpty()) {
+                handler.removeCallbacks(popupRunnable)
+                handler.postDelayed(popupRunnable, 350)
+            }
+            if (keyRect.key.type == KeyType.BACKSPACE) {
+                backspaceRepeating = false
+                handler.removeCallbacks(backspaceRunnable)
+                handler.postDelayed(backspaceRunnable, 400)
+            }
+        }
+        invalidate()
+    }
+
+    private fun moveTouch(pointerId: Int, x: Float, y: Float, rawX: Float) {
+        val touch = activeTouches[pointerId] ?: return
+        if (popupVisible && pointerId == ownerPointerId) {
+            if (popupBoxWidth > 0f && popupLabels.isNotEmpty()) {
+                val stride = popupBoxWidth + popupItemGap
+                val index = ((rawX - popupLeft - popupSidePadding) / stride)
+                    .toInt()
+                    .coerceIn(0, popupLabels.lastIndex)
+                if (index != popupSelected) {
+                    popupSelected = index
+                    popupView?.selected = index
+                    popupView?.invalidate()
+                }
+            }
+            return
+        }
+
+        val current = touch.keyRect
+        val dx = x - touch.downX
+        val dy = y - touch.downY
+        if (!touch.moved && dx * dx + dy * dy > touchSlop * touchSlop) {
+            touch.moved = true
+        }
+        if (!touch.moved) {
+            // Палец почти не двигался: держим клавишу, выбранную
+            // при нажатии, даже если точка пришлась на зазор.
+            return
+        }
+        if (y < 0f) {
+            cancelTouch(pointerId)
+            return
+        }
+        val next = findKey(x, y)
+        if (next == null) {
+            cancelTouch(pointerId)
+        } else if (next != current) {
+            switchPressedKey(pointerId, next)
+        }
+    }
+
+    private fun finishTouch(pointerId: Int, x: Float, y: Float, commit: Boolean) {
+        val touch = activeTouches[pointerId] ?: return
+        val isOwner = pointerId == ownerPointerId
+        if (isOwner) {
+            handler.removeCallbacks(popupRunnable)
+            handler.removeCallbacks(backspaceRunnable)
+        }
+
+        var keyRect: KeyRect? = touch.keyRect
+        if (commit && !(popupVisible && isOwner)) {
+            keyRect = findKey(x, y)
+        }
+
+        val wasPopup = popupVisible && isOwner
+        val selectedPopup = if (wasPopup) popupLabels.getOrNull(popupSelected) else null
+        val repeating = backspaceRepeating && isOwner
+
+        if (isOwner) {
+            dismissFloating()
+            backspaceRepeating = false
+        }
+        activeTouches.remove(pointerId)
+        if (isOwner) {
+            ownerPointerId = activeTouches.keys.firstOrNull() ?: -1
+        }
+
+        if (commit && keyRect != null) {
+            if (wasPopup && selectedPopup != null) {
+                commitPopup(selectedPopup)
+            } else if (!repeating) {
+                handleKey(keyRect.key)
+            }
+        }
+        invalidate()
+    }
+
+    private fun switchPressedKey(pointerId: Int, keyRect: KeyRect) {
+        val touch = activeTouches[pointerId] ?: return
+        touch.keyRect = keyRect
+        if (pointerId != ownerPointerId) {
+            invalidate()
+            return
+        }
         handler.removeCallbacks(popupRunnable)
         if (previewVisible) dismissFloating()
         if (backspaceRepeating) {
@@ -714,20 +791,22 @@ class KeyboardView(
         invalidate()
     }
 
-    private fun cancelPress() {
-        handler.removeCallbacks(popupRunnable)
-        handler.removeCallbacks(backspaceRunnable)
-        pressed = null
-        backspaceRepeating = false
-        if (previewVisible || popupVisible) dismissFloating()
+    private fun cancelTouch(pointerId: Int) {
+        activeTouches.remove(pointerId) ?: return
+        if (pointerId == ownerPointerId) {
+            handler.removeCallbacks(popupRunnable)
+            handler.removeCallbacks(backspaceRunnable)
+            backspaceRepeating = false
+            if (previewVisible || popupVisible) dismissFloating()
+            ownerPointerId = activeTouches.keys.firstOrNull() ?: -1
+        }
         invalidate()
     }
 
     private fun resetTouchState() {
         handler.removeCallbacksAndMessages(null)
-        pressed = null
-        pressedPointerId = -1
-        touchMoved = false
+        activeTouches.clear()
+        ownerPointerId = -1
         backspaceRepeating = false
         dismissFloating()
     }
@@ -829,8 +908,7 @@ class KeyboardView(
             performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
         }
         if (sound) {
-            val audio = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
-            audio.playSoundEffect(SoundEffectConstants.CLICK)
+            playSoundEffect(SoundEffectConstants.CLICK)
         }
     }
 

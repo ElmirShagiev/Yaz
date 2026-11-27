@@ -28,6 +28,10 @@ class KeyboardService : InputMethodService() {
         InputType.TYPE_TEXT_VARIATION_URI
     )
 
+    private val capsFlags = InputType.TYPE_TEXT_FLAG_CAP_CHARACTERS or
+        InputType.TYPE_TEXT_FLAG_CAP_WORDS or
+        InputType.TYPE_TEXT_FLAG_CAP_SENTENCES
+
     private val prefsListener = SharedPreferences.OnSharedPreferenceChangeListener { _, _ ->
         loadPrefs()
         applyToView()
@@ -57,11 +61,30 @@ class KeyboardService : InputMethodService() {
     override fun onStartInputView(info: EditorInfo?, restarting: Boolean) {
         super.onStartInputView(info, restarting)
         keyboardView?.setLanguage(language)
-        keyboardView?.resetForInput()
+        keyboardView?.resetForInput(prefersNumericInput(info))
         keyboardView?.setShift(shouldAutoShift(info))
     }
 
     override fun onEvaluateFullscreenMode(): Boolean = false
+
+    override fun onUpdateSelection(
+        oldSelStart: Int,
+        oldSelEnd: Int,
+        newSelStart: Int,
+        newSelEnd: Int,
+        candidatesStart: Int,
+        candidatesEnd: Int
+    ) {
+        super.onUpdateSelection(
+            oldSelStart,
+            oldSelEnd,
+            newSelStart,
+            newSelEnd,
+            candidatesStart,
+            candidatesEnd
+        )
+        updateAutoShift()
+    }
 
     fun onText(text: String) {
         currentInputConnection?.commitText(text, 1)
@@ -69,6 +92,11 @@ class KeyboardService : InputMethodService() {
 
     fun onBackspace() {
         val ic = currentInputConnection ?: return
+        val inputType = currentInputEditorInfo?.inputType ?: InputType.TYPE_NULL
+        if (inputType.and(InputType.TYPE_MASK_CLASS) == InputType.TYPE_NULL) {
+            sendDownUpKeyEvents(KeyEvent.KEYCODE_DEL)
+            return
+        }
         val selected = ic.getSelectedText(0)
         if (!selected.isNullOrEmpty()) {
             ic.commitText("", 1)
@@ -102,21 +130,38 @@ class KeyboardService : InputMethodService() {
         prefs.edit().putString(Prefs.LANGUAGE, newLanguage.name).apply()
     }
 
+    private fun prefersNumericInput(info: EditorInfo?): Boolean {
+        val inputType = info?.inputType ?: return false
+        return when (inputType and InputType.TYPE_MASK_CLASS) {
+            InputType.TYPE_CLASS_NUMBER,
+            InputType.TYPE_CLASS_PHONE,
+            InputType.TYPE_CLASS_DATETIME -> true
+            else -> false
+        }
+    }
+
+    private fun requestedCapsMode(info: EditorInfo?): Int {
+        val editorInfo = info ?: return 0
+        val inputType = editorInfo.inputType
+        if ((inputType and InputType.TYPE_MASK_CLASS) != InputType.TYPE_CLASS_TEXT) return 0
+        if ((inputType and InputType.TYPE_MASK_VARIATION) in noAutoCaps) return 0
+        return inputType and capsFlags
+    }
+
     private fun shouldAutoShift(info: EditorInfo?): Boolean {
         val editorInfo = info ?: return false
-        val inputType = editorInfo.inputType
-        if ((inputType and InputType.TYPE_MASK_CLASS) != InputType.TYPE_CLASS_TEXT) return false
-        if ((inputType and InputType.TYPE_MASK_VARIATION) in noAutoCaps) return false
+        return requestedCapsMode(editorInfo) != 0 && editorInfo.initialCapsMode != 0
+    }
 
-        val capsMask = TextUtils.CAP_MODE_CHARACTERS or
-            TextUtils.CAP_MODE_WORDS or
-            TextUtils.CAP_MODE_SENTENCES
-        if ((editorInfo.initialCapsMode and capsMask) != 0) return true
-
-        val capsFlags = InputType.TYPE_TEXT_FLAG_CAP_CHARACTERS or
-            InputType.TYPE_TEXT_FLAG_CAP_WORDS or
-            InputType.TYPE_TEXT_FLAG_CAP_SENTENCES
-        return (inputType and capsFlags) != 0
+    private fun updateAutoShift() {
+        val capsMode = requestedCapsMode(currentInputEditorInfo)
+        if (capsMode == 0) {
+            keyboardView?.setShift(false)
+            return
+        }
+        val before = currentInputConnection?.getTextBeforeCursor(64, 0) ?: return
+        val shouldShift = TextUtils.getCapsMode(before, before.length, capsMode) != 0
+        keyboardView?.setShift(shouldShift)
     }
 
     private inline fun <reified T : Enum<T>> enumPref(key: String, default: T): T =
